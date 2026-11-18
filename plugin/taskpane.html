@@ -472,6 +472,22 @@
                       <span id="mcpLastError" class="about-version">—</span>
                     </div>
                   </div>
+
+                  <!-- Streamable HTTP 局域网监听：默认关闭，开启后强制 Bearer token -->
+                  <div class="config-card">
+                    <div class="field">
+                      <label class="field-row">
+                        <input id="mcpHttpLanInput" type="checkbox" />
+                        <span>允许局域网连接（Streamable HTTP）</span>
+                      </label>
+                      <small class="field-tip">开启后会在 0.0.0.0 上另起监听，强制 Bearer token；仅建议在可信网络使用。</small>
+                    </div>
+                    <label class="field" style="max-width:180px">
+                      <span>局域网端口</span>
+                      <input id="mcpHttpLanPortInput" type="number" min="1024" max="65535" step="1" value="3891" placeholder="3891" />
+                    </label>
+                    <div id="mcpHttpLanHint" class="muted" style="margin-top:6px;font-size:11px">—</div>
+                  </div>
                 </div>
 
                 <div data-subtab-panel="mcp-config" class="settings-subtab-panel hidden" role="tabpanel">
@@ -479,7 +495,13 @@
                     <h3>客户端配置</h3>
                     <p class="muted">把下面这段 JSON 加到 Claude Code CLI 的 <code>~/.claude.json</code>（或 Claude Desktop 的 <code>claude_desktop_config.json</code> 的 <code>mcpServers</code> 字段）即可。</p>
                   </div>
+                  <!-- 两种接入方式：本地子进程（stdio）/ 直连本机 Streamable HTTP 端点 -->
+                  <div class="settings-subtabs" role="tablist" aria-label="客户端配置格式">
+                    <button id="mcpConfigModeStdio" type="button" class="settings-subtab-btn active" role="tab" aria-selected="true">stdio（本地子进程）</button>
+                    <button id="mcpConfigModeHttp" type="button" class="settings-subtab-btn" role="tab" aria-selected="false">Streamable HTTP</button>
+                  </div>
                   <textarea id="mcpConfigSnippet" class="config-snippet" rows="10" readonly></textarea>
+                  <div id="mcpHttpTokenHint" class="muted hidden" style="margin-top:8px;font-size:11px"></div>
                   <div class="settings-actions">
                     <button id="mcpCopyConfigBtn" class="ghost-btn" type="button">复制配置</button>
                   </div>
@@ -575,6 +597,23 @@
                     </div>
                   </div>
                   <div id="svcStatusBody" class="svc-status-body"><span class="muted">加载中…</span></div>
+                </div>
+
+                <!-- MCP Streamable HTTP 端点：本机 URL + 局域网地址，直接粘给 MCP 客户端 -->
+                <div class="config-card">
+                  <div class="config-card-head" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+                    <span style="font-weight:600;color:var(--text)">MCP HTTP 端点</span>
+                  </div>
+                  <p class="muted" style="margin:0 0 6px;font-size:11px">MCP 客户端可直接连这个 Streamable HTTP 端点，无需本地子进程。</p>
+                  <div id="svcMcpHttpRow" class="svc-status-body">
+                    <div class="svc-row">
+                      <span class="svc-kind">本机端点</span>
+                      <code id="svcMcpHttpLocal" style="flex:1;min-width:0;overflow-wrap:anywhere;font-size:11px">—</code>
+                      <button id="svcMcpHttpCopyBtn" class="ghost-btn compact-btn" type="button" title="复制本机 MCP HTTP 端点" disabled>复制</button>
+                    </div>
+                    <div id="svcMcpHttpLanList"></div>
+                    <div id="svcMcpHttpLanHint" class="muted" style="margin-top:6px;font-size:11px">局域网未开启（可在 MCP 服务面板开启）</div>
+                  </div>
                 </div>
               </section>
 

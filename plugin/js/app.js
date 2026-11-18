@@ -296,6 +296,8 @@
       // 缓存管理 UI
       "cacheTotalBadge", "cacheRefreshBtn", "cacheClearSafeBtn", "cacheGroupsList",
       "svcStatusBody", "svcMemBadge", "svcStatusRefreshBtn",
+      // 服务状态：MCP Streamable HTTP 端点（本机 / 局域网）；容器 svcMcpHttpRow 无 JS 引用，不采集
+      "svcMcpHttpLocal", "svcMcpHttpCopyBtn", "svcMcpHttpLanList", "svcMcpHttpLanHint",
       "cacheAutoCleanEnabled", "cacheAutoCleanMaxAge", "cacheAutoCleanMaxSize", "cacheAutoCleanStatus",
       // 灰度更新 UI
       "updateChannelBadge", "canaryHeaderBadge", "aboutDeviceSn", "copyDeviceSnBtn",
@@ -363,7 +365,9 @@
       "skillsList", "skillImportBtn", "skillCloudRefreshBtn", "skillImportFile",
       "skillsSearchInput", "skillsCategoryChips",
       "mcpServerEnabledInput", "mcpStatusBadge", "mcpToolCount", "mcpLastError",
-      "mcpConfigSnippet", "mcpCopyConfigBtn", "mcpToolsList",
+      "mcpHttpLanInput", "mcpHttpLanPortInput", "mcpHttpLanHint",
+      "mcpConfigSnippet", "mcpCopyConfigBtn", "mcpConfigModeStdio", "mcpConfigModeHttp", "mcpHttpTokenHint",
+      "mcpToolsList",
       "mcpCallLogList", "mcpCallLogClearBtn",
       "presetPickerModal", "presetPickerList",
       // TaskPane 停靠/浮动切换
@@ -3438,6 +3442,47 @@
       els.svcStatusRefreshBtn.dataset.bound = "1";
       els.svcStatusRefreshBtn.addEventListener("click", () => { loadServiceStatus(); });
     }
+    // MCP HTTP 本机端点复制（局域网地址的复制走 svcMcpHttpLanList 上的事件委托）
+    if (els.svcMcpHttpCopyBtn && els.svcMcpHttpCopyBtn.dataset.bound !== "1") {
+      els.svcMcpHttpCopyBtn.dataset.bound = "1";
+      els.svcMcpHttpCopyBtn.addEventListener("click", () => {
+        copyMcpHttpUrl(els.svcMcpHttpLocal?.dataset?.url || "");
+      });
+    }
+  }
+
+  // 复制一条 MCP HTTP 端点；剪贴板不可用时选中文本兜底，至少能让用户手动 Ctrl+C。
+  async function copyMcpHttpUrl(url) {
+    if (!url) {
+      showMessage("暂无可复制的端点", "error", { duration: 2000 });
+      return;
+    }
+    const ok = await copyToClipboard(url);
+    if (ok) {
+      showMessage("MCP HTTP 端点已复制", "success", { duration: 2000 });
+      return;
+    }
+    try {
+      // 兜底选中文本：本机端点用缓存元素，局域网行从按钮所在的 .svc-row 里找 <code>
+      let el = null;
+      if (els.svcMcpHttpLocal && els.svcMcpHttpLocal.dataset?.url === url) {
+        el = els.svcMcpHttpLocal;
+      } else {
+        const rows = document.querySelectorAll ? document.querySelectorAll(".svc-row") : [];
+        for (let i = 0; i < rows.length; i++) {
+          const code = rows[i].querySelector ? rows[i].querySelector("code") : null;
+          if (code && (code.textContent || "").trim() === url) { el = code; break; }
+        }
+      }
+      if (el) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    } catch (e) {}
+    showMessage("复制失败，请手动选中文本复制", "error", { duration: 3000 });
   }
 
   // 把各种异常/错误体转成可读字符串，避免 String(object) 出 "[object Object]"。
@@ -3472,6 +3517,66 @@
       '<div class="muted" style="margin:8px 0 4px;font-size:11px">内存占用（合计 ' + fmtBytesShort(total) + '）</div>' +
       memRows +
       (data.nodeVersion ? '<div class="muted" style="margin-top:6px;font-size:11px">Node ' + escapeHtml(data.nodeVersion) + ' · 已运行 ' + uptimeMin + ' 分钟</div>' : "");
+    // MCP Streamable HTTP 端点（旧版 proxy 没有 mcpHttp 字段，这里会显示「—」）
+    renderServiceMcpHttp(data && data.mcpHttp);
+  }
+
+  // 把一段 HTML/文本压成短签名：4s 轮询时内容没变就别重写 innerHTML，
+  // 否则会把用户选中的文本冲掉（复制时经常先全选再按 Ctrl+C）。
+  function contentSig(s) {
+    const str = String(s || "");
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+    return str.length + ":" + h;
+  }
+
+  // 「服务状态」里的 MCP HTTP 端点块：本机端点 + 局域网地址逐条列出。
+  // 数据来自 /service/status 的 mcpHttp；字段缺失（旧 proxy / 请求失败）一律降级成「—」。
+  function renderServiceMcpHttp(http) {
+    const info = (http && typeof http === "object") ? http : {};
+    const localUrl = typeof info.localUrl === "string" ? info.localUrl : "";
+    const localEl = els.svcMcpHttpLocal;
+    if (localEl) {
+      localEl.textContent = localUrl || "—";
+      if (localUrl) localEl.dataset.url = localUrl;
+      else delete localEl.dataset.url;
+    }
+    if (els.svcMcpHttpCopyBtn) els.svcMcpHttpCopyBtn.disabled = !localUrl;
+    const lanUrls = (Array.isArray(info.lanUrls) ? info.lanUrls : [])
+      .filter((u) => typeof u === "string" && u);
+    const lanList = els.svcMcpHttpLanList;
+    if (lanList) {
+      // 每行都有复制按钮，用容器上的事件委托，避免 innerHTML 重绘后重复绑定
+      if (lanList.dataset.bound !== "1") {
+        lanList.dataset.bound = "1";
+        lanList.addEventListener("click", (ev) => {
+          const btn = ev.target && ev.target.closest ? ev.target.closest("[data-copy-url]") : null;
+          if (!btn) return;
+          copyMcpHttpUrl(btn.dataset.copyUrl || "");
+        });
+      }
+      const html = lanUrls.map((u) =>
+        '<div class="svc-row"><code style="flex:1;min-width:0;overflow-wrap:anywhere;font-size:11px">' + escapeHtml(u) + '</code>' +
+        '<button class="ghost-btn compact-btn" type="button" data-copy-url="' + escapeAttr(u) + '">复制</button></div>'
+      ).join("");
+      const sig = contentSig(html);
+      if (lanList.dataset.sig !== sig) {
+        lanList.innerHTML = html;
+        lanList.dataset.sig = sig;
+      }
+    }
+    const hint = els.svcMcpHttpLanHint;
+    if (hint) {
+      if (!localUrl) {
+        hint.textContent = "—";
+      } else if (!info.lanEnabled) {
+        hint.textContent = "局域网未开启（可在 MCP 服务面板开启）";
+      } else if (lanUrls.length) {
+        hint.textContent = i18nT("局域网已开启（{n} 个地址，强制 Bearer token）", { n: lanUrls.length });
+      } else {
+        hint.textContent = "局域网已开启（未检测到局域网 IP）";
+      }
+    }
   }
 
   // 拉后台服务的端口 + 内存占用。失败先让 Runtime 重探端口（dev 下 proxy 常在 3892，
@@ -3504,6 +3609,8 @@
       if (els.svcMemBadge) els.svcMemBadge.textContent = "内存 —";
       body.innerHTML = '<span class="muted">读取失败：' + escapeHtml(errText(e)) +
         '。确认后台服务已启动；若刚改过 proxy 代码（dev），请重跑 npm run dev 让新代理带上该接口。</span>';
+      // 请求失败时不保留上一次的端点，统一降级成「—」
+      renderServiceMcpHttp(null);
     }
   }
 
@@ -3666,6 +3773,32 @@
   // ============ MCP 服务 UI ============
   let _mcpStatusUnsub = null;
   let _mcpProxyStatusTimer = null;
+  // 客户端配置的两种模式：stdio（本地子进程）/ Streamable HTTP（直连本机端点）
+  let _mcpConfigMode = "stdio";
+  let _mcpStdioScript = "";   // 最近一次解析出的 mcp-server.js 绝对路径
+  let _mcpHttpInfo = null;    // 最近一次 /mcp/status 返回的 http 字段
+  let _mcpHttpBusy = false;   // 局域网配置请求是否在飞行中（飞行中不改控件，避免打架）
+  let _mcpHttpStickyHint = null; // { text, until }：提交失败时钉住的提示，15s 内不被 4s 轮询覆盖
+  const MCP_HTTP_STICKY_MS = 15000;
+  const MCP_HTTP_CONFIG_TIMEOUT_MS = 5000;
+
+  // 提交结果的提示钉住一段时间：错因（监听没起来 / 超时 / 401）比「未开启」更有信息量，
+  // 不能让 4s 轮询立刻拿状态文案覆盖掉。
+  function setMcpHttpStickyHint(text) {
+    _mcpHttpStickyHint = text ? { text: String(text), until: Date.now() + MCP_HTTP_STICKY_MS } : null;
+    if (text && els.mcpHttpLanHint) els.mcpHttpLanHint.textContent = String(text);
+  }
+
+  // 提示优先级：sticky（提交结果，15s）> 实时监听状态；状态未知时明确说出来，别假装「未开启」。
+  function mcpHttpHintTextNow(info) {
+    const sticky = _mcpHttpStickyHint;
+    if (sticky) {
+      if (Date.now() < sticky.until) return sticky.text;
+      _mcpHttpStickyHint = null;
+    }
+    if (!info) return i18nT("无法确认 MCP HTTP 服务状态，请稍后刷新或重开设置页");
+    return mcpHttpLanHintText(info);
+  }
 
   // 把 WpsAiAddon.getUrlPath() (URL 形式) 转成本地 FS 路径，给 MCP 配置 JSON 用。
   // 输入示例:
@@ -3713,7 +3846,268 @@
         lastError: local.lastError || null,
         lastRegisteredAt: j.registeredAt || local.lastRegisteredAt || null
       });
+      // 局域网监听态 + 客户端配置片段跟着 /mcp/status 的 http 字段刷新
+      renderMcpHttpControls(j.http);
     } catch (e) {}
+  }
+
+  // ---- MCP 客户端配置片段：stdio（本地子进程）/ Streamable HTTP（直连本机端点）----
+  function mcpHttpBaseUrl() {
+    // 优先用 proxy 报告的真实端点；旧 proxy 没有该字段时用 proxyBase 拼一个兜底地址
+    const u = _mcpHttpInfo && typeof _mcpHttpInfo.localUrl === "string" ? _mcpHttpInfo.localUrl : "";
+    return u || ((global.WpsAiRuntime?.proxyBase?.() || "http://127.0.0.1:3890") + "/mcp/http");
+  }
+
+  // stdio 片段（沿用原有结构）：command + args + env
+  function writeMcpSnippet(mcpScript) {
+    // 只记住真正的绝对路径（Windows 盘符 / Unix 根路径），占位符和相对路径不能缓存，
+    // 否则下次切回 stdio 会把「<填入 plugin 安装路径>/…」这种假路径写进配置。
+    if (mcpScript && /^([A-Za-z]:[\\/]|\/)/.test(mcpScript)) _mcpStdioScript = mcpScript;
+    if (_mcpConfigMode !== "stdio") return; // HTTP 模式下不要覆盖用户正在看的片段
+    const token = global.WpsAiMcpBridge?.getToken?.() || "";
+    const cfg = {
+      mcpServers: {
+        "wps-ai": {
+          command: "node",
+          args: [_mcpStdioScript || "<填入 plugin 安装路径>/tools/mcp-server.js"],
+          env: Object.assign(
+            { WPS_PROXY_PORT: "3890" },
+            token ? { WPS_MCP_TOKEN: token } : {}
+          )
+        }
+      }
+    };
+    if (els.mcpConfigSnippet) {
+      const next = JSON.stringify(cfg, null, 2);
+      // 内容没变就别重写，避免每 4 秒轮询把用户选中的文本冲掉
+      if (els.mcpConfigSnippet.value !== next) els.mcpConfigSnippet.value = next;
+    }
+  }
+
+  // Streamable HTTP 片段：直连本机端点，不需要本地子进程。
+  // type 取 "http"：Claude Code 只认 http / streamable-http / sse / ws，
+  // 不认驼峰的 streamableHttp（Cline / VS Code 认，写在下方提示里让用户自行取舍）。
+  function writeMcpHttpSnippet() {
+    if (_mcpConfigMode !== "http") return;
+    const cfg = {
+      mcpServers: {
+        "wps-ai": {
+          type: "http",
+          url: mcpHttpBaseUrl()
+        }
+      }
+    };
+    if (els.mcpConfigSnippet) {
+      const next = JSON.stringify(cfg, null, 2);
+      if (els.mcpConfigSnippet.value !== next) els.mcpConfigSnippet.value = next;
+    }
+    renderMcpHttpTokenHint();
+  }
+
+  // HTTP 模式的片段说明（JSON 不能写注释，只能放 textarea 下方）：
+  // 1) type 取值的客户端差异；2) 走局域网地址时必须在请求头里带 Bearer token。
+  function renderMcpHttpTokenHint() {
+    const host = els.mcpHttpTokenHint;
+    if (!host) return;
+    if (_mcpConfigMode !== "http") {
+      host.classList.add("hidden");
+      if (host.dataset.sig !== "") {
+        host.textContent = "";
+        host.dataset.sig = "";
+      }
+      return;
+    }
+    const info = _mcpHttpInfo || {};
+    const lanUrls = (Array.isArray(info.lanUrls) ? info.lanUrls : [])
+      .filter((u) => typeof u === "string" && u);
+    let html = "<div>" + escapeHtml(i18nT("客户端配置里的 type 写「http」；Cline / VS Code 等客户端也可写作「streamableHttp」。")) + "</div>";
+    if (info.lanEnabled && lanUrls.length) {
+      html +=
+        '<div style="margin-top:6px">' + escapeHtml(i18nT("局域网地址访问时需在请求头里补上 token（把 token 换成实际值）：")) + "</div>" +
+        '<pre style="margin:0;white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Consolas,monospace">' +
+        escapeHtml('"headers": { "Authorization": "Bearer <token>" }') +
+        "</pre>";
+    }
+    host.classList.remove("hidden");
+    // 内容没变不重绘：4s 轮询里保住用户选中的文本
+    const sig = contentSig(html);
+    if (host.dataset.sig !== sig) {
+      host.innerHTML = html;
+      host.dataset.sig = sig;
+    }
+  }
+
+  function syncMcpConfigModeUi() {
+    [["stdio", els.mcpConfigModeStdio], ["http", els.mcpConfigModeHttp]].forEach(([mode, btn]) => {
+      if (!btn) return;
+      const active = _mcpConfigMode === mode;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    if (_mcpConfigMode === "http") writeMcpHttpSnippet();
+    else renderMcpHttpTokenHint(); // 切回 stdio 时收起 HTTP 说明（否则会残留）
+  }
+
+  function setMcpConfigMode(mode) {
+    _mcpConfigMode = mode === "http" ? "http" : "stdio";
+    syncMcpConfigModeUi();
+    // 切回 stdio 时立即按上次解析到的路径重写（路径探测由 renderMcpPanel 负责）
+    if (_mcpConfigMode === "stdio") writeMcpSnippet();
+  }
+
+  function setMcpHttpControlsDisabled(on) {
+    [els.mcpHttpLanInput, els.mcpHttpLanPortInput].forEach((el) => {
+      if (el) el.disabled = !!on;
+    });
+  }
+
+  // 局域网状态提示：开启时显示实际监听地址（端口已被占用时会顺延，以 proxy 返回为准）
+  function mcpHttpLanHintText(info) {
+    if (!info || typeof info !== "object") return "—";
+    const lanUrls = (Array.isArray(info.lanUrls) ? info.lanUrls : [])
+      .filter((u) => typeof u === "string" && u);
+    if (!info.lanEnabled) return "未开启局域网监听（仅本机可用）";
+    if (!lanUrls.length) return "局域网已开启（未检测到局域网 IP）";
+    // 多网卡时不要把另外几个地址藏起来，至少让用户知道还有别的地址
+    if (lanUrls.length > 1) {
+      return i18nT("局域网已监听：{addr} 等 {n} 个地址", { addr: lanUrls[0], n: lanUrls.length });
+    }
+    return i18nT("局域网已监听：{addr}", { addr: lanUrls[0] });
+  }
+
+  function renderMcpHttpControls(http) {
+    const info = (http && typeof http === "object") ? http : null;
+    if (info) _mcpHttpInfo = info;
+    // 端点可能有变（换端口 / 开关监听），HTTP 模式的片段跟着重写
+    if (_mcpConfigMode === "http") writeMcpHttpSnippet();
+    if (_mcpHttpBusy) return; // 请求飞行中：不要覆盖正在提交的控件状态
+    // 拿到过真实状态就以最近一次为准：提交失败后回滚开关/端口，状态未知时禁用控件
+    const known = info || _mcpHttpInfo;
+    if (!known) {
+      setMcpHttpControlsDisabled(true);
+      if (els.mcpHttpLanHint) els.mcpHttpLanHint.textContent = mcpHttpHintTextNow(null);
+      return;
+    }
+    setMcpHttpControlsDisabled(false);
+    const lanInput = els.mcpHttpLanInput;
+    const lanEnabled = !!known.lanEnabled;
+    if (lanInput && lanInput.checked !== lanEnabled) lanInput.checked = lanEnabled;
+    const portInput = els.mcpHttpLanPortInput;
+    // 用户正在改端口时不打断输入，避免轮询把刚敲的数字冲掉
+    if (portInput && document.activeElement !== portInput) {
+      const p = Number(known.lanPort) || 3891;
+      if (portInput.value !== String(p)) portInput.value = String(p);
+    }
+    if (els.mcpHttpLanHint) els.mcpHttpLanHint.textContent = mcpHttpHintTextNow(known);
+  }
+
+  // 开关局域网监听 / 改端口 → POST /mcp/http/config（配置由 proxy 自己持久化）
+  // 后端契约：bridgeToken 已建立时必须带 Authorization: Bearer <token>（否则 401）；
+  // 请求开 LAN 但监听没起来时返回 { ok:false, error, lanError, lanEnabled:false, ... }。
+  async function submitMcpHttpConfig() {
+    if (_mcpHttpBusy) return;
+    const lan = !!els.mcpHttpLanInput?.checked;
+    const portInput = els.mcpHttpLanPortInput;
+    // 端口校验：留空 = 保持当前端口（不带 port）；填了就必须是合法整数端口，否则不发请求
+    const raw = portInput ? String(portInput.value == null ? "" : portInput.value).trim() : "";
+    let port = null;
+    if (raw) {
+      port = Number(raw);
+      if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+        showMessage(i18nT("端口需为 1024–65535 之间的整数"), "error", { duration: 3000 });
+        if (portInput) portInput.value = String(_mcpHttpInfo?.lanPort ?? 3891);
+        return;
+      }
+    }
+    _mcpHttpBusy = true;
+    _mcpHttpStickyHint = null; // 新的一次提交，旧结果不再钉住提示
+    setMcpHttpControlsDisabled(true);
+    if (els.mcpHttpLanHint) els.mcpHttpLanHint.textContent = "正在保存…";
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), MCP_HTTP_CONFIG_TIMEOUT_MS) : 0;
+    try {
+      const base = global.WpsAiRuntime?.proxyBase?.() || "http://127.0.0.1:3890";
+      const payload = { lan };
+      if (port !== null) payload.port = port;
+      const headers = { "Content-Type": "application/json" };
+      // token 建立后后端会强制校验；空 token 时不要发 `Bearer `（那种头会被判 401）
+      const token = global.WpsAiMcpBridge?.getToken?.() || "";
+      if (token) headers.Authorization = "Bearer " + token;
+      const resp = await fetch(base + "/mcp/http/config", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: ctrl ? ctrl.signal : undefined
+      });
+      let j = null;
+      try { j = await resp.json(); } catch (e) { j = null; }
+      // 响应头之后 body 阶段才超时也会走到这里：统一按「请求超时」处理，别报成 HTTP 200
+      if (ctrl && ctrl.signal.aborted) {
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        throw err;
+      }
+      const detail = errText(j && (j.error || j.lanError || j.message));
+      if (!resp.ok || !j) {
+        throw new Error(detail || ("HTTP " + resp.status));
+      }
+      _mcpHttpBusy = false; // 先放开，才能让下面的渲染生效
+      if (j.ok === false) {
+        // 配置被接受但监听没起来（端口占用等）：钉住真实原因，别让 4s 轮询改写成「未开启」
+        const failMsg = i18nT("MCP HTTP 设置失败：{err}", { err: detail || i18nT("监听未启动") });
+        setMcpHttpStickyHint(failMsg);
+        renderMcpHttpControls(_mcpHttpInfo); // 开关/端口回到上一次真实状态
+        showMessage(failMsg, "error");
+      } else {
+        renderMcpHttpControls(j);
+        if (!raw) {
+          // 短提示（5s，非阻断）：撑过一次 4s 轮询即可，别长钉遮住真实监听状态
+          _mcpHttpStickyHint = { text: i18nT("端口留空，已保持当前端口不变"), until: Date.now() + 5000 };
+          if (els.mcpHttpLanHint) els.mcpHttpLanHint.textContent = _mcpHttpStickyHint.text;
+        }
+        showMessage(j.lanEnabled ? "已开启局域网 MCP HTTP 监听" : "已关闭局域网 MCP HTTP 监听", "success", { duration: 2000 });
+      }
+      // proxy 的 listen 回调可能晚于响应：补一次刷新拉真实监听态（sticky 提示会护住错因）
+      setTimeout(() => { try { refreshMcpStatusFromProxy(); } catch (e) {} }, 800);
+    } catch (e) {
+      _mcpHttpBusy = false; // 先放开，回滚渲染才会生效
+      const aborted = !!e && (e.name === "AbortError" || /aborted/i.test(String(e.message || e)));
+      const msg = aborted ? i18nT("请求超时") : errText(e);
+      if (_mcpHttpInfo) {
+        setMcpHttpStickyHint(i18nT("保存失败：{err}", { err: msg }));
+      }
+      renderMcpHttpControls(_mcpHttpInfo); // 回滚开关/端口；未知状态则禁用控件 + 说明
+      showMessage(i18nT("MCP HTTP 设置失败：{err}", { err: msg }), "error");
+      // 响应失败/超时未必代表没生效，再拉一次真实状态
+      setTimeout(() => { try { refreshMcpStatusFromProxy(); } catch (e2) {} }, 800);
+    } finally {
+      if (timer) clearTimeout(timer);
+      _mcpHttpBusy = false;
+      // 状态未知（从未拿到 http 字段）时保持控件禁用，避免用户在假状态上操作
+      setMcpHttpControlsDisabled(!_mcpHttpInfo);
+    }
+  }
+
+  // 绑定只需一次：renderMcpPanel 每次切 tab 都会重跑，用 dataset.bound 防重复
+  function bindMcpHttpControlsOnce() {
+    const lanInput = els.mcpHttpLanInput;
+    if (lanInput && lanInput.dataset.bound !== "1") {
+      lanInput.dataset.bound = "1";
+      lanInput.addEventListener("change", () => { submitMcpHttpConfig(); });
+    }
+    const portInput = els.mcpHttpLanPortInput;
+    if (portInput && portInput.dataset.bound !== "1") {
+      portInput.dataset.bound = "1";
+      portInput.addEventListener("change", () => { submitMcpHttpConfig(); });
+      portInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") { ev.preventDefault(); submitMcpHttpConfig(); }
+      });
+    }
+    [["stdio", els.mcpConfigModeStdio], ["http", els.mcpConfigModeHttp]].forEach(([mode, btn]) => {
+      if (!btn || btn.dataset.bound === "1") return;
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => setMcpConfigMode(mode));
+    });
   }
 
   function renderMcpPanel() {
@@ -3732,25 +4126,13 @@
     if (_mcpProxyStatusTimer) { clearInterval(_mcpProxyStatusTimer); }
     _mcpProxyStatusTimer = setInterval(refreshMcpStatusFromProxy, 4000);
 
+    // 局域网开关 / 端口 / 配置模式切换（只绑一次，renderMcpPanel 会反复进来）
+    bindMcpHttpControlsOnce();
+    syncMcpConfigModeUi();
+
     // 配置 JSON 片段：优先从 WpsAiAddon.getUrlPath() 推 plugin 安装的本地 FS 路径（dev 模式
     // 用 file:// 时能直接拿到）。生产安装走 http://localhost 推不出来，向 proxy 问 /install-path
     // 拿真实 mcp-server.js 的绝对路径。
-    function writeMcpSnippet(mcpScript) {
-      const token = global.WpsAiMcpBridge?.getToken?.() || "";
-      const cfg = {
-        mcpServers: {
-          "wps-ai": {
-            command: "node",
-            args: [mcpScript],
-            env: Object.assign(
-              { WPS_PROXY_PORT: "3890" },
-              token ? { WPS_MCP_TOKEN: token } : {}
-            )
-          }
-        }
-      };
-      if (els.mcpConfigSnippet) els.mcpConfigSnippet.value = JSON.stringify(cfg, null, 2);
-    }
     const installRoot = detectPluginInstallPath();
     if (installRoot) {
       writeMcpSnippet(`${installRoot}/tools/mcp-server.js`);

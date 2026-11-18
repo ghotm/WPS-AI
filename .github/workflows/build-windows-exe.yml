@@ -1,0 +1,96 @@
+name: 构建 Windows 安装包
+
+# 触发方式：
+#   1. push 到 main（改动 plugin/、installer/ 或本文件时）
+#   2. 推送 v* 标签（如 v1.4.8），产物同时挂到 GitHub Release
+#   3. 手动 workflow_dispatch
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugin/**"
+      - "installer/**"
+      - ".github/workflows/build-windows-exe.yml"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Windows x64 安装包
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # 打包前先跑 MCP 传输层单测（纯 Node，无外部依赖）
+      - name: 运行 MCP HTTP 相关测试
+        working-directory: plugin
+        shell: pwsh
+        run: |
+          node --test test/mcp-jsonrpc.test.js test/mcp-http-transport.test.js
+
+      - name: 下载便携 Node 运行时（win-x64）
+        working-directory: plugin
+        shell: pwsh
+        run: |
+          node tools/bundle-node.js --platform win-x64
+          if (-not (Test-Path "runtime/node-win-x64/node.exe")) {
+            Write-Error "便携 Node 运行时缺失：plugin/runtime/node-win-x64/node.exe"
+            exit 1
+          }
+
+      - name: 安装 Inno Setup
+        shell: pwsh
+        run: |
+          # windows-latest 一般已自带 Inno Setup 6；没有则用 choco 安装
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y
+            $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) { Write-Error "未找到 ISCC.exe"; exit 1 }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "使用编译器：$iscc"
+
+      - name: 编译安装包
+        working-directory: installer
+        shell: pwsh
+        run: |
+          $version = node -p "require('../plugin/package.json').version"
+          if (-not $version) { Write-Error "无法读取 plugin/package.json 的 version"; exit 1 }
+          Write-Host "版本号：$version"
+          & $env:ISCC "/DMyAppVersion=$version" "lingxi-ai.iss"
+          if ($LASTEXITCODE -ne 0) { Write-Error "ISCC 编译失败（退出码 $LASTEXITCODE）"; exit $LASTEXITCODE }
+          Get-ChildItem ../dist/*.exe | Select-Object Name, Length
+
+      - name: 上传安装包产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: lingxi-ai-windows-setup
+          path: dist/lingxi-ai-*-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      # 推 v* 标签时，把 exe 附加到对应 Release
+      - name: 附加到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/lingxi-ai-*-setup.exe
+          generate_release_notes: true

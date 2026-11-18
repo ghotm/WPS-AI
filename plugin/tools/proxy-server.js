@@ -41,6 +41,7 @@ const { buildRemoteImageHeaders, shouldUseChromiumFallback } = require("./remote
 const { fetchImageWithChromium } = require("./chromium-fetch");
 const { searchImages } = require("./image-search");
 const { handleMcpcRequest, sharedManager: mcpcManager, sharedTokenGate: mcpcTokenGate } = require("./mcp-client-manager.js");
+const { handleStreamableHttpReq, MCP_HTTP_PATH } = require("./mcp-http-transport.js");
 
 // 生成图保存目录。放到用户目录下，避免 WPS/macOS 对 /var/folders 临时目录图片 AddPicture 静默失败。
 const RENDER_DIR = path.join(os.homedir(), ".lingxi-ai", "render");
@@ -166,7 +167,8 @@ const PROXY_PORT_LADDER_SIZE = Number(process.env.PROXY_PORT_LADDER_SIZE) || 20;
 // 服务签名：前端 healthz 探测时用 X-Lingxi-Service 头区分是不是我们的进程。
 const PROXY_SERVICE_SIG = "lingxi-ai-proxy/v1";
 const PROXY_FEATURES = [
-  "active-pdf-path"
+  "active-pdf-path",
+  "mcp-http"
 ];
 // 运行时端口落地文件：启动后写入实际监听的端口，给原生侧 / dev launcher 兜底读取。
 const RUNTIME_PORT_FILE = path.join(os.homedir(), ".lingxi-ai", "runtime-port.json");
@@ -1187,7 +1189,7 @@ function proxyRequest(targetUrl, method, headers, body, clientRes, extraOptions 
 const mcpState = {
   tools: [],                         // 最近一次 plugin 注册的工具清单
   pluginRegisteredAt: 0,             // plugin 上线时间戳（ms）
-  pendingCalls: new Map(),           // call_id → { res, ts }，外部投递后挂着等结果
+  pendingCalls: new Map(),           // call_id → { res, ts }（老式 /mcp/call）或 { resolve, ts, timer }（HTTP 传输）
   inboxForPlugin: [],                // plugin /poll 时按 FIFO 出队的 call
   pollerHolds: []                    // plugin 长轮询的 res 列队（一次取一个）
 };
@@ -1213,14 +1215,336 @@ function dispatchCallToPlugin(call) {
   }
 }
 
+// ===== MCP Streamable HTTP 传输（规范 2025-03-26，无状态实现） =====
+// 本机端点复用 proxy 端口：http://127.0.0.1:<proxyPort>/mcp/http
+// 局域网端点默认关闭；开启后另起 0.0.0.0:<port> 监听，只暴露该路径并强制 Bearer token
+// （远程可执行 WPS 工具，必须鉴权；proxy 主监听仍只绑 127.0.0.1，不扩大暴露面）。
+const MCP_HTTP_CONFIG_FILE = path.join(LINGXI_HOME, "mcp-http.json");
+// 环境变量是脏输入：非法值（小数、0、负数、>65535）会让 listen 抛同步异常，
+// 导致 lanStarting 卡死、后续再也起不来，所以这里先收敛到合法端口。
+const MCP_HTTP_DEFAULT_LAN_PORT = (function () {
+  const p = Number(process.env.MCP_HTTP_LAN_PORT);
+  return p > 0 && p < 65536 ? p : 3891;
+})();
+const MCP_HTTP_LAN_LADDER = 6;
+const MCP_HTTP_MIN_LAN_PORT = 1024;
+const MCP_HTTP_MAX_LAN_PORT = 65535;
+const mcpHttpState = {
+  lanEnabled: false,      // 持久化的期望态（配置文件里的开关）
+  lanWant: false,         // 运行时期望态：true 表示「希望有监听」，含正在 listen 期间
+  lanPort: MCP_HTTP_DEFAULT_LAN_PORT,
+  lanServer: null,        // 真正在 0.0.0.0 上监听的 server
+  lanPending: null,       // 已 listen 但还没回调的 server（用于取消迟到监听）
+  lanPendingPort: 0,      // 上面那个 server 想监听的端口
+  lanStarting: false,
+  lanActualPort: 0,
+  lanError: null,         // 最近一次启动失败原因（成功时清空）
+  bridgeToken: ""
+};
+
+function isMcpHttpLanPort(p) {
+  return Number.isInteger(p) && p >= MCP_HTTP_MIN_LAN_PORT && p <= MCP_HTTP_MAX_LAN_PORT;
+}
+
+function bearerToken(headers) {
+  const raw = String((headers && headers.authorization) || "").trim();
+  const m = /^Bearer\s+(.+)$/i.exec(raw);
+  return m ? m[1].trim() : "";
+}
+
+// plugin 的每个 /mcp/* 请求都带同一个 token（mcp-bridge 生成后存 WpsAiStore）。
+// 首次见到就记住，作为局域网端点的鉴权凭据（TOFU，与 /mcpc/* 的 fileTokenGate 同理）。
+// 首次即固化，不随后续请求覆盖：否则任何能打到 proxy 的调用方都可以用一个新 token
+// 把信任锚顶掉（等于自己有写权限）。plugin 换 token 需重启 proxy。
+function rememberMcpBridgeToken(req) {
+  const t = bearerToken(req.headers);
+  if (t && !mcpHttpState.bridgeToken) mcpHttpState.bridgeToken = t;
+}
+
+function tokenEquals(a, b) {
+  const x = Buffer.from(String(a || ""), "utf8");
+  const y = Buffer.from(String(b || ""), "utf8");
+  if (!x.length || x.length !== y.length) return false;
+  try { return crypto.timingSafeEqual(x, y); } catch (e) { return false; }
+}
+
+function loadMcpHttpConfig() {
+  try {
+    const j = JSON.parse(fs.readFileSync(MCP_HTTP_CONFIG_FILE, "utf8"));
+    mcpHttpState.lanEnabled = !!j.lanEnabled;
+    const p = Number(j.lanPort);
+    if (p > 0 && p < 65536) mcpHttpState.lanPort = p;
+  } catch (e) { /* 首次运行没有配置文件 */ }
+}
+
+function persistMcpHttpConfig() {
+  try {
+    fs.mkdirSync(path.dirname(MCP_HTTP_CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(MCP_HTTP_CONFIG_FILE, JSON.stringify({
+      lanEnabled: !!mcpHttpState.lanEnabled,
+      lanPort: mcpHttpState.lanPort
+    }, null, 2), { mode: 0o600 });
+    // 文件已存在时 writeFileSync 的 mode 不生效，再 chmod 一次收敛权限。
+    try { fs.chmodSync(MCP_HTTP_CONFIG_FILE, 0o600); } catch (e) {}
+  } catch (e) {
+    console.warn("[mcp] 保存 mcp-http 配置失败:", e.message);
+  }
+}
+
+// 枚举本机非回环 IPv4，供「服务状态」展示局域网连接地址。
+function lanIpv4List() {
+  const out = [];
+  try {
+    const nets = os.networkInterfaces();
+    Object.keys(nets).forEach((name) => {
+      (nets[name] || []).forEach((ni) => {
+        if (ni && ni.family === "IPv4" && !ni.internal && ni.address) out.push(ni.address);
+      });
+    });
+  } catch (e) { /* best-effort */ }
+  return Array.from(new Set(out)).slice(0, 4);
+}
+
+function mcpHttpInfo() {
+  const port = mcpHttpState.lanActualPort || mcpHttpState.lanPort;
+  return {
+    localUrl: `http://127.0.0.1:${RESOLVED_PROXY_PORT}${MCP_HTTP_PATH}`,
+    lanEnabled: !!mcpHttpState.lanServer,     // 只表示「真的在监听」
+    lanConfigured: !!mcpHttpState.lanEnabled, // 用户想要的状态（可能启动失败）
+    lanError: mcpHttpState.lanError || null,
+    lanPort: port,
+    lanUrls: mcpHttpState.lanServer
+      ? lanIpv4List().map((ip) => `http://${ip}:${port}${MCP_HTTP_PATH}`)
+      : [],
+    tokenRequired: true
+  };
+}
+
+// backend：把 HTTP 层的 tools/list、tools/call 映射到现有 plugin 长轮询桥
+const proxyMcpBackend = {
+  async listTools() {
+    if (!pluginAlive()) {
+      return { status: 503, ok: false, error: "WPS plugin 未连接（请确认 WPS 已打开且插件开启了 MCP 服务）" };
+    }
+    return { status: 200, ok: true, tools: mcpState.tools };
+  },
+  callTool(name, args) {
+    if (!pluginAlive()) return Promise.resolve({ ok: false, error: "WPS plugin 未连接" });
+    return new Promise((resolve) => {
+      const callId = genCallId();
+      const timer = setTimeout(() => {
+        if (!mcpState.pendingCalls.has(callId)) return;
+        mcpState.pendingCalls.delete(callId);
+        resolve({ ok: false, error: "plugin 未在 60s 内返回结果" });
+      }, MCP_CALL_TIMEOUT_MS);
+      if (timer.unref) timer.unref();
+      mcpState.pendingCalls.set(callId, { resolve, ts: Date.now(), timer });
+      dispatchCallToPlugin({ callId, name, args });
+    });
+  }
+};
+
+// 局域网端点不写 CORS 头：远程 MCP 客户端是 CLI，不需要 CORS；
+// 浏览器跨站本来就拿不到响应体，写 CORS 只会多一层暴露面。
+function writeMcpHttpJson(res, code, body, cors) {
+  if (cors) {
+    sendJson(res, code, body);
+    return;
+  }
+  try {
+    res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(body));
+  } catch (e) { /* 连接已断，忽略 */ }
+}
+
+// 本机 / 局域网共用的 HTTP 处理：读 body → 传输层 → 写回 JSON。
+async function serveMcpHttp(req, res, opts) {
+  const requireToken = !!(opts && opts.requireToken);
+  const cors = !(opts && opts.cors === false);
+  if (requireToken) {
+    // 未建立 token 与 token 不匹配统一回 401 unauthorized，具体原因只打日志：
+    // 以免外部探测到「plugin 是否在线」。
+    const ok = tokenEquals(bearerToken(req.headers), mcpHttpState.bridgeToken);
+    if (!ok) {
+      if (!mcpHttpState.bridgeToken) {
+        console.warn("[mcp] 局域网请求被拒：鉴权 token 尚未建立（WPS plugin 未连接？）");
+      } else {
+        console.warn("[mcp] 局域网请求被拒：Authorization token 不匹配");
+      }
+      writeMcpHttpJson(res, 401, { ok: false, error: "unauthorized" }, cors);
+      return;
+    }
+  }
+  let body = "";
+  if (req.method === "POST") {
+    try {
+      body = await readBody(req);
+    } catch (e) {
+      writeMcpHttpJson(res, 400, { ok: false, error: e.message || String(e) }, cors);
+      return;
+    }
+  }
+  const out = await handleStreamableHttpReq({
+    method: req.method,
+    pathname: MCP_HTTP_PATH,
+    headers: req.headers,
+    body
+  }, proxyMcpBackend);
+  if (!out) {
+    writeMcpHttpJson(res, 404, { ok: false, error: "not found" }, cors);
+    return;
+  }
+  if (cors) setCorsHeaders(res);
+  if (out.headers) {
+    Object.keys(out.headers).forEach((k) => res.setHeader(k, out.headers[k]));
+  }
+  res.writeHead(out.status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(out.body == null ? "" : JSON.stringify(out.body));
+}
+
+function startMcpHttpLanServer(port, attemptsLeft) {
+  if (mcpHttpState.lanServer || mcpHttpState.lanPending) return;
+  mcpHttpState.lanWant = true;
+  mcpHttpState.lanError = null;
+  mcpHttpState.lanStarting = true;
+  const srv = http.createServer(async (req, res) => {
+    try {
+      const parsed = new URL(req.url, "http://localhost");
+      if (parsed.pathname !== MCP_HTTP_PATH) {
+        writeMcpHttpJson(res, 404, { ok: false, error: "not found" }, false);
+        return;
+      }
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      await serveMcpHttp(req, res, { requireToken: true, cors: false });
+    } catch (e) {
+      try {
+        writeMcpHttpJson(res, 500, { ok: false, error: (e && e.message) || String(e) }, false);
+      } catch (_) {}
+    }
+  });
+  mcpHttpState.lanPending = srv;
+  mcpHttpState.lanPendingPort = port;
+  // 只清掉「还是自己」的 pending，避免把后续顺延出来的新 server 误清。
+  const clearPending = () => {
+    if (mcpHttpState.lanPending === srv) {
+      mcpHttpState.lanPending = null;
+      mcpHttpState.lanPendingPort = 0;
+    }
+  };
+  srv.once("error", (e) => {
+    clearPending();
+    mcpHttpState.lanStarting = false;
+    try { srv.close(); } catch (_) {}
+    // 已被 stop 取消：不再顺延，也不要写 lanError 覆盖用户意图。
+    if (!mcpHttpState.lanWant) return;
+    if (e.code === "EADDRINUSE" && attemptsLeft > 0 && port < MCP_HTTP_MAX_LAN_PORT) {
+      console.warn(`[mcp] 局域网端口 ${port} 被占用，尝试 ${port + 1}`);
+      startMcpHttpLanServer(port + 1, attemptsLeft - 1);
+      return;
+    }
+    mcpHttpState.lanError = e.code === "EADDRINUSE"
+      ? `局域网端口 ${port} 被占用（已尝试顺延 ${MCP_HTTP_LAN_LADDER - attemptsLeft} 次）`
+      : (e.message || String(e));
+    console.warn("[mcp] 局域网监听启动失败:", e.message);
+  });
+  const onListening = () => {
+    // 迟到监听：listen 已成功、但 stop 期间期望态已被置 false，
+    // 这里必须立刻关掉，否则 0.0.0.0 会漏在后台继续监听。
+    if (!mcpHttpState.lanWant) {
+      mcpHttpState.lanStarting = false;
+      clearPending();
+      try { srv.close(); } catch (e) {}
+      return;
+    }
+    srv.removeAllListeners("error");
+    srv.on("error", (e) => console.warn("[mcp] 局域网监听错误:", e.message));
+    mcpHttpState.lanStarting = false;
+    clearPending();
+    mcpHttpState.lanServer = srv;
+    mcpHttpState.lanActualPort = port;
+    mcpHttpState.lanError = null;
+    console.log(`[mcp] Streamable HTTP 局域网监听: http://0.0.0.0:${port}${MCP_HTTP_PATH}（强制 Bearer token）`);
+  };
+  try {
+    srv.listen(port, "0.0.0.0", onListening);
+  } catch (e) {
+    // listen 同步抛异常（端口越界等）：必须复位状态，否则 lanStarting 永久为 true。
+    mcpHttpState.lanStarting = false;
+    clearPending();
+    mcpHttpState.lanError = (e && e.message) || String(e);
+    try { srv.close(); } catch (_) {}
+    console.warn("[mcp] 局域网监听启动异常:", mcpHttpState.lanError);
+  }
+}
+
+function stopMcpHttpLanServer() {
+  // 先落期望态，再关 server：这样即使某个 listen 回调迟到，也会走「立刻 close」分支。
+  mcpHttpState.lanWant = false;
+  mcpHttpState.lanStarting = false;
+  mcpHttpState.lanError = null;
+  const pending = mcpHttpState.lanPending;
+  const srv = mcpHttpState.lanServer;
+  mcpHttpState.lanPending = null;
+  mcpHttpState.lanPendingPort = 0;
+  mcpHttpState.lanServer = null;
+  mcpHttpState.lanActualPort = 0;
+  if (pending) {
+    try { pending.close(); } catch (e) {}
+  }
+  if (srv) {
+    try { srv.close(); } catch (e) {}
+    console.log("[mcp] Streamable HTTP 局域网监听已关闭");
+  }
+}
+
+function setMcpHttpLan(enabled, port) {
+  const hasPort = port !== undefined && port !== null && port !== "";
+  const p = Number(port);
+  // 只接受合法整数端口：小数 / 0 / 越界值直接拒绝（不静默沿用旧端口），
+  // 否则前端会看到「改端口成功」但其实还在老端口上。
+  if (hasPort && !isMcpHttpLanPort(p)) {
+    const msg = `局域网端口非法：必须是 ${MCP_HTTP_MIN_LAN_PORT}-${MCP_HTTP_MAX_LAN_PORT} 之间的整数`;
+    console.warn("[mcp] 拒绝非法的局域网端口:", String(port));
+    return { ok: false, error: msg };
+  }
+  if (hasPort) mcpHttpState.lanPort = p;
+  mcpHttpState.lanEnabled = !!enabled;
+  mcpHttpState.lanWant = mcpHttpState.lanEnabled;
+  if (mcpHttpState.lanEnabled) {
+    // 已在监听但端口变了：先停再起，否则端口切换会静默失效（还返回旧端口的 ok:true）。
+    const listeningPortMismatch = mcpHttpState.lanServer
+      && mcpHttpState.lanActualPort !== mcpHttpState.lanPort;
+    const pendingPortMismatch = mcpHttpState.lanPending
+      && mcpHttpState.lanPendingPort !== mcpHttpState.lanPort;
+    if (listeningPortMismatch || pendingPortMismatch) {
+      stopMcpHttpLanServer();
+      mcpHttpState.lanWant = true;
+    }
+    startMcpHttpLanServer(mcpHttpState.lanPort, MCP_HTTP_LAN_LADDER);
+  } else {
+    stopMcpHttpLanServer();
+  }
+  persistMcpHttpConfig();
+  return { ok: true };
+}
+
 // 周期性 GC：超时的 pendingCalls / 长轮询 / inbox
 setInterval(() => {
   const now = Date.now();
   // pending calls 超时
   mcpState.pendingCalls.forEach((entry, id) => {
     if (now - entry.ts > MCP_CALL_TIMEOUT_MS) {
-      try { sendJson(entry.res, 504, { ok: false, error: "plugin 未在 60s 内返回结果" }); } catch (e) {}
       mcpState.pendingCalls.delete(id);
+      try { if (entry.timer) clearTimeout(entry.timer); } catch (e) {}
+      if (entry.resolve) {
+        try { entry.resolve({ ok: false, error: "plugin 未在 60s 内返回结果" }); } catch (e) {}
+      } else {
+        try { sendJson(entry.res, 504, { ok: false, error: "plugin 未在 60s 内返回结果" }); } catch (e) {}
+      }
     }
   });
   // 长轮询超时：返回空（plugin 收到 204 会立刻发新一轮）
@@ -1698,9 +2022,66 @@ const server = http.createServer(async (req, res) => {
     if (out) { setCorsHeaders(res); sendJson(res, out.status, out.body); return; }
   }
 
+  // ===== MCP Streamable HTTP 传输（POST /mcp/http）=====
+  // 本机端点复用 proxy 端口，不强制 token（与 /mcp/call 一致）。
+  if (pathname === MCP_HTTP_PATH) {
+    try {
+      await serveMcpHttp(req, res, { requireToken: false });
+    } catch (e) {
+      const msg = (e && e.message) || String(e);
+      if (!res.headersSent) {
+        try { sendJson(res, 500, { ok: false, error: msg }); } catch (_) {}
+      } else {
+        try { res.end(); } catch (_) {}
+      }
+    }
+    return;
+  }
+
+  // POST /mcp/http/config —— 设置页开关局域网监听；持久化到 ~/.lingxi-ai/mcp-http.json
+  if (pathname === "/mcp/http/config" && method === "POST") {
+    try {
+      // 本机会话可直接改；一旦 token 已建立（说明 plugin 在线），同样要求 Bearer，
+      // 避免任意本机进程/浏览器跨站页面静默打开 0.0.0.0 暴露面。
+      if (mcpHttpState.bridgeToken && !tokenEquals(bearerToken(req.headers), mcpHttpState.bridgeToken)) {
+        sendJson(res, 401, { ok: false, error: "unauthorized" });
+        return;
+      }
+      const body = await readBody(req);
+      const json = JSON.parse(body.toString("utf8"));
+      const lan = typeof json.lan === "boolean" ? json.lan : !!mcpHttpState.lanEnabled;
+      const setRes = setMcpHttpLan(lan, json.port);
+      if (!setRes.ok) {
+        sendJson(res, 200, { ok: false, error: setRes.error, ...mcpHttpInfo() });
+        return;
+      }
+      // 监听是异步的：等最多 1s，让响应里的 lanEnabled/lanUrls 反映真实状态，
+      // 否则设置页刚勾选时会先看到「未开启」。
+      if (lan) {
+        for (let i = 0; i < 20 && mcpHttpState.lanPending && !mcpHttpState.lanServer; i++) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+      }
+      if (lan && !mcpHttpState.lanServer) {
+        // 200 + ok:false：前端按 ok 判断，仍能读到 lanError / lanPort 等字段。
+        sendJson(res, 200, {
+          ok: false,
+          error: mcpHttpState.lanError || "局域网监听未启动（端口被占用？）",
+          ...mcpHttpInfo()
+        });
+        return;
+      }
+      sendJson(res, 200, { ok: true, ...mcpHttpInfo() });
+    } catch (e) {
+      sendJson(res, 400, { ok: false, error: (e && e.message) || String(e) });
+    }
+    return;
+  }
+
   // POST /mcp/register —— WPS plugin 上报最新工具清单（含 description / inputSchema）
   if (pathname === "/mcp/register" && method === "POST") {
     try {
+      rememberMcpBridgeToken(req);
       const body = await readBody(req);
       const json = JSON.parse(body.toString("utf8"));
       if (!Array.isArray(json.tools)) {
@@ -1719,6 +2100,7 @@ const server = http.createServer(async (req, res) => {
 
   // GET /mcp/poll —— plugin 长轮询。有任务立即返回，没任务挂着直到 25s 超时（GC 兜底）
   if (pathname === "/mcp/poll" && method === "GET") {
+    rememberMcpBridgeToken(req);
     if (mcpState.inboxForPlugin.length > 0) {
       const call = mcpState.inboxForPlugin.shift();
       sendJson(res, 200, { ok: true, call });
@@ -1732,6 +2114,7 @@ const server = http.createServer(async (req, res) => {
   // POST /mcp/result —— plugin 完成 call 后回传结果
   if (pathname === "/mcp/result" && method === "POST") {
     try {
+      rememberMcpBridgeToken(req);
       const body = await readBody(req);
       const json = JSON.parse(body.toString("utf8"));
       const callId = String(json.callId || "");
@@ -1741,13 +2124,13 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       mcpState.pendingCalls.delete(callId);
-      try {
-        sendJson(entry.res, 200, {
-          ok: !!json.ok,
-          value: json.value,
-          error: json.error || null
-        });
-      } catch (e) {}
+      try { if (entry.timer) clearTimeout(entry.timer); } catch (e) {}
+      const payload = { ok: !!json.ok, value: json.value, error: json.error || null };
+      if (entry.resolve) {
+        try { entry.resolve(payload); } catch (e) {}
+      } else {
+        try { sendJson(entry.res, 200, payload); } catch (e) {}
+      }
       sendJson(res, 200, { ok: true });
     } catch (e) {
       sendJson(res, 400, { ok: false, error: e.message });
@@ -1790,13 +2173,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET /mcp/status —— UI / bridge 都能查：plugin 是否在线 + 工具个数
+  // GET /mcp/status —— UI / bridge 都能查：plugin 是否在线 + 工具个数 + HTTP 端点信息
   if (pathname === "/mcp/status" && method === "GET") {
     sendJson(res, 200, {
       ok: true,
       pluginAlive: pluginAlive(),
       toolCount: mcpState.tools.length,
-      registeredAt: mcpState.pluginRegisteredAt || null
+      registeredAt: mcpState.pluginRegisteredAt || null,
+      http: mcpHttpInfo()
     });
     return;
   }
@@ -2229,7 +2613,8 @@ const server = http.createServer(async (req, res) => {
       self: { pid: process.pid, rssBytes: self.rss, uptimeSec: Math.round(process.uptime()) },
       processes: procs,
       totalRssBytes,
-      nodeVersion: process.version
+      nodeVersion: process.version,
+      mcpHttp: mcpHttpInfo()
     });
     return;
   }
@@ -3351,7 +3736,15 @@ function startProxyListenLadder(port, attemptsLeft) {
     console.log("  GET  /mcp/tools → 外部 MCP bridge 拿工具清单");
     console.log("  POST /mcp/call → 外部 MCP bridge 投递工具调用");
     console.log("  GET  /mcp/status → 查询 plugin 在线 + 工具数");
+    console.log(`  POST ${MCP_HTTP_PATH} → MCP Streamable HTTP 端点（本机，复用本端口）`);
+    console.log("  POST /mcp/http/config → 开关局域网监听（0.0.0.0 + Bearer token）");
   });
+
+  // 恢复上次保存的局域网开关（配置文件 ~/.lingxi-ai/mcp-http.json）
+  loadMcpHttpConfig();
+  if (mcpHttpState.lanEnabled) {
+    startMcpHttpLanServer(mcpHttpState.lanPort, MCP_HTTP_LAN_LADDER);
+  }
 }
 
 startProxyListenLadder(PROXY_PORT, PROXY_PORT_LADDER_SIZE);

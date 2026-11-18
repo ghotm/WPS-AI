@@ -112,6 +112,39 @@ Settings → MCP → enable to expose WPS tools to external agents (Claude Code 
 - Tools grouped by host
 - Live status badge (Connected / Enabled-not-connected / Disabled)
 
+**Streamable HTTP endpoint (local / LAN)**
+
+- Local: `http://127.0.0.1:3890/mcp/http` — reuses the proxy port, no extra process, active while the MCP server toggle is on
+- LAN: Settings → MCP → enable "Allow LAN connections"; the proxy then listens on `0.0.0.0:3891` (auto +1 when busy) and **requires** `Authorization: Bearer <token>` (same token as `WPS_MCP_TOKEN` in the stdio config)
+- The Service Status panel shows the actual local / LAN URLs, ready to copy
+
+```json
+{
+  "mcpServers": {
+    "wps-ai": {
+      "type": "http",
+      "url": "http://127.0.0.1:3890/mcp/http"
+    }
+  }
+}
+```
+
+The `type` value varies by client: Claude Code / Claude Desktop use `http`, while Cline / VS Code also accept `streamableHttp`; clients that take no `type` (e.g. Cursor) can keep just `url`.
+
+For LAN access, add the header (URL from the Service Status panel):
+
+```json
+{
+  "mcpServers": {
+    "wps-ai": {
+      "type": "http",
+      "url": "http://192.168.1.10:3891/mcp/http",
+      "headers": { "Authorization": "Bearer <WPS_MCP_TOKEN>" }
+    }
+  }
+}
+```
+
 ---
 
 ## Project Layout
@@ -133,6 +166,8 @@ plugin/
 └── tools/
     ├── proxy-server.js            # CORS proxy + file ops + backup + MCP endpoints
     ├── mcp-server.js              # stdio MCP server (for external agents)
+    ├── mcp-jsonrpc.js             # MCP JSON-RPC core (shared by stdio / Streamable HTTP)
+    ├── mcp-http-transport.js      # Streamable HTTP transport (POST /mcp/http)
     ├── serve-permanent.js         # permanent-mode static server
     ├── build-variants.js          # multi-host variant build
     └── dev.js / gen-ribbon.js

@@ -123,6 +123,39 @@ WPS 宿主（文字/表格/演示/PDF）
 - **MCP Server**：把 WPS 工具暴露给外部 agent（Claude Code CLI / Claude Desktop / Cursor），配置 JSON 一键复制
 - **MCP Client**：连接外部 MCP 服务（本地 stdio 子进程 / 远程 SSE），把它们的工具纳入 AI 对话，命名空间 `mcp__<服务>__<工具>`；支持启停开关 / 查看工具清单与参数 / 测试连接 / 从 JSON 一键导入
 
+**Streamable HTTP 端点（本机 / 局域网）**
+
+- 本机：`http://127.0.0.1:3890/mcp/http`，复用 proxy 端口，随「MCP 服务」开关一起生效，无需额外进程
+- 局域网：设置 → MCP 服务 → 开启「允许局域网连接」，proxy 会另起 `0.0.0.0:3891` 监听（端口被占用自动 +1）；该端点**强制** `Authorization: Bearer <token>`，token 与 stdio 配置里的 `WPS_MCP_TOKEN` 相同
+- 「服务状态」面板会显示本机 / 局域网的实际连接地址，可直接复制
+
+```json
+{
+  "mcpServers": {
+    "wps-ai": {
+      "type": "http",
+      "url": "http://127.0.0.1:3890/mcp/http"
+    }
+  }
+}
+```
+
+不同类型的客户端对 `type` 的写法略有差异：Claude Code / Claude Desktop 用 `http`，Cline / VS Code 等也可写作 `streamableHttp`；不支持 `type` 的客户端（如 Cursor）只保留 `url` 即可。
+
+局域网访问时追加请求头（URL 换成服务状态里显示的局域网地址）：
+
+```json
+{
+  "mcpServers": {
+    "wps-ai": {
+      "type": "http",
+      "url": "http://192.168.1.10:3891/mcp/http",
+      "headers": { "Authorization": "Bearer <WPS_MCP_TOKEN>" }
+    }
+  }
+}
+```
+
 ### 对话 / 时间轴
 
 - **Claude-code 风格时间轴**：推理 / 工具调用 / 文本回复交织，rail 节点圆点 + 每步耗时；实时展示 == 历史回放完全一致
@@ -182,6 +215,8 @@ plugin/
     ├── proxy-server.js             # CORS 代理 + 文件 / 备份 / MCP 端点
     ├── mcp-client-manager.js       # MCP Client 连接管理（stdio / SSE，Node 侧）
     ├── mcp-server.js               # stdio MCP server（供外部 agent 用）
+    ├── mcp-jsonrpc.js              # MCP JSON-RPC 核心（stdio / Streamable HTTP 共用）
+    ├── mcp-http-transport.js       # Streamable HTTP 传输（POST /mcp/http）
     ├── serve-permanent.js          # 永久模式静态服务器
     ├── build-variants.js           # 多宿主变体打包
     └── dev.js / gen-ribbon.js

@@ -24,6 +24,8 @@
 
 const http = require("http");
 const { URL } = require("url");
+// JSON-RPC 核心与 proxy 的 POST /mcp/http 共用，避免 stdio / HTTP 两套逻辑漂移。
+const { handleRequest, makeError } = require("./mcp-jsonrpc.js");
 
 const PROXY_HOST = process.env.WPS_PROXY_HOST || "127.0.0.1";
 const PROXY_PORT = Number(process.env.WPS_PROXY_PORT) || 3890;
@@ -32,13 +34,6 @@ const PROXY_BASE = `http://${PROXY_HOST}:${PROXY_PORT}`;
 // 我们把它作为 Authorization: Bearer <token> 传给 proxy，未来 proxy 侧强制校验
 // 后同机进程也不能未授权调 WPS 工具。老版本 proxy 忽略这个 header 不会 break。
 const MCP_TOKEN = process.env.WPS_MCP_TOKEN || "";
-
-// 协议常量
-const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = {
-  name: "lingxi-wps-ai",
-  version: "1.0.0"
-};
 
 // ====== HTTP 工具 ======
 function httpRequest(method, path, body) {
@@ -75,89 +70,34 @@ function httpRequest(method, path, body) {
   });
 }
 
-// ====== MCP JSON-RPC 处理 ======
+// ====== MCP JSON-RPC ======
+// 传输无关的核心在 mcp-jsonrpc.js；这里只提供「走 HTTP 到 proxy」的 backend。
 
 function writeMessage(msg) {
   // MCP 使用 LSP 风格 framing？不，标准 MCP 走 stdio 时是 newline-delimited JSON
   process.stdout.write(JSON.stringify(msg) + "\n");
 }
 
-function makeResult(id, result) {
-  return { jsonrpc: "2.0", id, result };
-}
-function makeError(id, code, message, data) {
-  return { jsonrpc: "2.0", id, error: { code, message, ...(data ? { data } : {}) } };
-}
-
-async function handleRequest(req) {
-  const { id, method, params } = req;
-  try {
-    if (method === "initialize") {
-      // 返回 server capabilities
-      return makeResult(id, {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: {
-          tools: {}     // 支持 tools/list 和 tools/call
-        },
-        serverInfo: SERVER_INFO
-      });
+const backend = {
+  async listTools() {
+    const { status, body } = await httpRequest("GET", "/mcp/tools");
+    if (status !== 200 || !body?.ok) {
+      return { status, ok: false, error: body?.error || `HTTP ${status}` };
     }
-
-    if (method === "notifications/initialized") {
-      // 通知，无返回
-      return null;
+    return { status, ok: true, tools: body.tools || [] };
+  },
+  async callTool(name, args) {
+    const { status, body } = await httpRequest("POST", "/mcp/call", { name, args });
+    if (status !== 200) {
+      // 非 200 属于传输层失败（proxy 出错/重启），由核心转成 JSON-RPC 错误而非 isError
+      return { ok: false, transport: true, error: "调用 WPS 工具失败: " + (body?.error || `HTTP ${status}`) };
     }
-
-    if (method === "tools/list") {
-      const { status, body } = await httpRequest("GET", "/mcp/tools");
-      if (status !== 200 || !body?.ok) {
-        const err = body?.error || `HTTP ${status}`;
-        // plugin 未在线时 list 返回空，不报错（避免 client 把整个 server 标红）
-        if (status === 503) {
-          return makeResult(id, { tools: [] });
-        }
-        return makeError(id, -32000, "拉取工具清单失败: " + err);
-      }
-      const tools = (body.tools || []).map((t) => ({
-        name: t.name,
-        description: t.description || "",
-        inputSchema: t.parameters || t.inputSchema || { type: "object", properties: {} }
-      }));
-      return makeResult(id, { tools });
+    if (!body?.ok) {
+      return { ok: false, error: body?.error || "执行失败" };
     }
-
-    if (method === "tools/call") {
-      const name = params?.name;
-      const args = params?.arguments || {};
-      if (!name) return makeError(id, -32602, "缺 name 参数");
-      const { status, body } = await httpRequest("POST", "/mcp/call", { name, args });
-      if (status !== 200) {
-        const err = body?.error || `HTTP ${status}`;
-        return makeError(id, -32000, "调用 WPS 工具失败: " + err);
-      }
-      if (!body?.ok) {
-        // tool 执行失败 → MCP 用 isError + text content 返回
-        return makeResult(id, {
-          isError: true,
-          content: [{ type: "text", text: String(body?.error || "执行失败") }]
-        });
-      }
-      // tool 成功 → 把 value 序列化成 text
-      const value = body.value;
-      const text = typeof value === "string"
-        ? value
-        : JSON.stringify(value, null, 2);
-      return makeResult(id, {
-        content: [{ type: "text", text }]
-      });
-    }
-
-    // 其他 MCP 方法（resources/* prompts/* 等）暂不支持
-    return makeError(id, -32601, `未实现的 MCP 方法: ${method}`);
-  } catch (e) {
-    return makeError(id, -32603, "内部错误: " + (e?.message || e));
+    return { ok: true, value: body.value };
   }
-}
+};
 
 // ====== stdin 读取 (newline-delimited JSON) ======
 
@@ -177,10 +117,10 @@ process.stdin.on("data", (chunk) => {
       writeMessage(makeError(null, -32700, "JSON parse error: " + e.message));
       continue;
     }
-    handleRequest(req).then((resp) => {
+    handleRequest(req, backend).then((resp) => {
       if (resp) writeMessage(resp);
     }).catch((e) => {
-      writeMessage(makeError(req.id || null, -32603, "未捕获错误: " + (e?.message || e)));
+      writeMessage(makeError(req?.id ?? null, -32603, "未捕获错误: " + (e?.message || e)));
     });
   }
 });
